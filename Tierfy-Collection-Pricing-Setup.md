@@ -23,7 +23,7 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
 <!-- Tierfy Collection Pricing & PDP Control -->
 <script>
 (function() {
-    const currentCustomerTags = "{% if customer %}{{ customer.tags | join: ',' | downcase }}{% endif %}";
+    const currentCustomerTags = "{% if customer %}{{ customer.tags | join: ',' | downcase | escape }}{% endif %}";
     const currencySymbol = "{{ cart.currency.symbol }}";
 
     // 1. Product Detail Page (PDP): Hide table if it only has 1 tier for Min Qty = 1
@@ -47,7 +47,7 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
         }
     }
 
-    // 2. Collection Page Discount Display
+    // 2. Collection & PDP Discount Display
     function loadTieredPrices() {
         const priceElements = Array.from(document.querySelectorAll('.tierfy-collection-price:not(.tierfy-processed)'));
         if (priceElements.length === 0) return;
@@ -56,9 +56,9 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
         let allProductIds = [], allTags = [], allCollectionIds = [], allSkus = [];
         priceElements.forEach(el => {
             if (el.dataset.productId) allProductIds.push(el.dataset.productId);
-            if (el.dataset.tags) allTags = allTags.concat(el.dataset.tags.split(',').map(s => s.trim()));
+            if (el.dataset.tags) allTags = allTags.concat(el.dataset.tags.split(',').map(s => s.trim().toLowerCase()));
             if (el.dataset.collectionIds) allCollectionIds = allCollectionIds.concat(el.dataset.collectionIds.split(',').map(s => s.trim()));
-            if (el.dataset.skus) allSkus = allSkus.concat(el.dataset.skus.split(',').map(s => s.trim()));
+            if (el.dataset.skus) allSkus = allSkus.concat(el.dataset.skus.split(',').map(s => s.trim().toLowerCase()));
         });
 
         const uniqueProductIds = [...new Set(allProductIds)].filter(Boolean).join(',');
@@ -79,66 +79,120 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
 
               priceElements.forEach(el => {
                   const pData = {
-                      id: el.dataset.productId,
+                      id: String(el.dataset.productId || ''),
                       price: parseFloat(el.dataset.productPrice || 0),
-                      tags: (el.dataset.tags || '').split(',').map(s => s.trim()),
-                      collectionIds: (el.dataset.collectionIds || '').split(',').map(s => s.trim()),
-                      skus: (el.dataset.skus || '').split(',').map(s => s.trim())
+                      tags: (el.dataset.tags || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+                      collectionIds: (el.dataset.collectionIds || '').split(',').map(s => s.trim()).filter(Boolean),
+                      skus: (el.dataset.skus || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
                   };
 
+                  // Check if this element is inside the main product page (PDP) section
+                  const isPdpElement = Boolean(el.closest('.product, .product__info-wrapper, .product__info-container, .product-single, .product-form, main [class*="product"]'));
+
+                  // Match rules for this specific product
                   const matchingRules = data.rules.filter(rule => {
-                      if (rule.customerSelection !== 'TAGS') return false;
                       let rVals = [];
-                      try { rVals = JSON.parse(rule.targetValues); } catch(e) { rVals = rule.targetValues.split(','); }
+                      try {
+                          const parsed = JSON.parse(rule.targetValues);
+                          rVals = Array.isArray(parsed) ? parsed : [String(parsed)];
+                      } catch(e) {
+                          rVals = String(rule.targetValues).split(',');
+                      }
                       rVals = rVals.map(v => String(v).toLowerCase().trim());
-                      if (rule.targetType === 'PRODUCT') return rVals.some(v => v.includes(String(pData.id)));
-                      if (rule.targetType === 'COLLECTION') return rVals.some(v => pData.collectionIds.includes(v.split('/').pop()));
-                      if (rule.targetType === 'TAG') return rVals.some(v => pData.tags.includes(v));
-                      if (rule.targetType === 'SKU') return rVals.some(v => pData.skus.includes(v));
+
+                      if (rule.targetType === 'PRODUCT') {
+                          return rVals.some(v => {
+                              const shortV = v.split('/').pop();
+                              return v === pData.id || shortV === pData.id || pData.id.includes(shortV);
+                          });
+                      }
+                      if (rule.targetType === 'COLLECTION') {
+                          return rVals.some(v => {
+                              const shortV = v.split('/').pop();
+                              return pData.collectionIds.includes(v) || pData.collectionIds.includes(shortV);
+                          });
+                      }
+                      if (rule.targetType === 'TAG') {
+                          return rVals.some(v => pData.tags.includes(v));
+                      }
+                      if (rule.targetType === 'SKU') {
+                          return rVals.some(v => pData.skus.includes(v));
+                      }
                       return false;
                   });
 
                   if (matchingRules.length === 0) return;
 
-                  let allTiers = [];
+                  // Consolidate tiers across matching rules by minQuantity (keeping best discount)
+                  const tierMap = new Map();
                   matchingRules.forEach(r => {
-                      if (r.tiers) {
-                          allTiers = allTiers.concat(r.tiers.map(t => {
-                              let savings = 0;
-                              if (t.discountType === 'PERCENTAGE') {
-                                  savings = Math.floor((pData.price * 100 * t.discountValue) / 100) / 100;
-                              } else {
-                                  savings = parseFloat(t.discountValue);
-                              }
-                              return { ...t, _savings: savings };
-                          }));
-                      }
+                      if (!r.tiers || !Array.isArray(r.tiers)) return;
+                      r.tiers.forEach(t => {
+                          const minQty = parseInt(t.minQuantity, 10);
+                          if (isNaN(minQty)) return;
+
+                          let savings = 0;
+                          const discountVal = parseFloat(t.discountValue || 0);
+                          if (t.discountType === 'PERCENTAGE') {
+                              const priceInCents = Math.round(pData.price * 100);
+                              const discountInCents = Math.floor((priceInCents * discountVal) / 100);
+                              savings = discountInCents / 100;
+                          } else {
+                              savings = discountVal;
+                          }
+
+                          const tierObj = { ...t, minQuantity: minQty, _savings: savings };
+                          const existing = tierMap.get(minQty);
+                          if (!existing || tierObj._savings > existing._savings) {
+                              tierMap.set(minQty, tierObj);
+                          }
+                      });
                   });
 
-                  if (allTiers.length === 0) return;
+                  const uniqueTiers = Array.from(tierMap.values()).sort((a, b) => a.minQuantity - b.minQuantity);
+                  if (uniqueTiers.length === 0) return;
 
-                  const tierQty1 = allTiers.find(t => parseInt(t.minQuantity, 10) === 1);
-                  const maxSavingsTier = allTiers.reduce((prev, current) => (prev._savings > current._savings) ? prev : current);
+                  const tierQty1 = uniqueTiers.find(t => t.minQuantity === 1);
+                  const maxSavingsTier = uniqueTiers.reduce((prev, curr) => (prev._savings > curr._savings) ? prev : curr);
 
                   let newHtml = '';
                   const originalPriceStr = pData.price.toFixed(2);
                   const originalPriceHtml = `<span style="text-decoration: line-through; opacity: 0.6; margin-right: 6px;">${currencySymbol}${originalPriceStr}</span>`;
 
-                  if (tierQty1 && allTiers.length === 1) {
+                  if (uniqueTiers.length === 1 && tierQty1) {
+                      // Case 1: Single flat discount (e.g. VIP/Tag 50% off for min qty 1)
                       const newPrice = (pData.price - tierQty1._savings).toFixed(2);
                       newHtml = `${originalPriceHtml} <span style="color: #e32c2b; font-weight: bold;">${currencySymbol}${newPrice}</span>`;
-                  } else if (allTiers.length > 1) {
+                  } else if (isPdpElement) {
+                      // Case 2: PDP with multiple volume tiers
+                      // PDP main price should show unit price (Qty 1), while the table below displays volume breaks
+                      if (tierQty1) {
+                          const newPrice = (pData.price - tierQty1._savings).toFixed(2);
+                          newHtml = `${originalPriceHtml} <span style="color: #e32c2b; font-weight: bold;">${currencySymbol}${newPrice}</span>`;
+                      } else {
+                          return; // No discount on Qty 1; leave original PDP price intact
+                      }
+                  } else if (uniqueTiers.length > 1) {
+                      // Case 3: Collection page card with multiple volume tiers
                       const minPrice = (pData.price - maxSavingsTier._savings).toFixed(2);
                       newHtml = `<span style="color: #e32c2b; font-weight: bold;">As low as ${currencySymbol}${minPrice}</span>`;
                   } else if (!tierQty1) {
+                      // Case 4: Single volume tier starting at qty > 1 (e.g. Buy 5+ get 20% off)
                       const newPrice = (pData.price - maxSavingsTier._savings).toFixed(2);
                       newHtml = `<span style="font-weight: bold; color: #e32c2b;">Buy ${maxSavingsTier.minQuantity}+ for ${currencySymbol}${newPrice}/ea</span>`;
                   }
 
-                  const ogPriceEl = el.querySelector('.original-theme-price');
-                  if (ogPriceEl) ogPriceEl.style.display = 'none';
+                  if (newHtml) {
+                      const ogPriceEl = el.querySelector('.original-theme-price');
+                      if (ogPriceEl) ogPriceEl.style.display = 'none';
 
-                  el.insertAdjacentHTML('beforeend', `<div class="tierfy-smart-price">${newHtml}</div>`);
+                      const existingSmartPrice = el.querySelector('.tierfy-smart-price');
+                      if (existingSmartPrice) {
+                          existingSmartPrice.innerHTML = newHtml;
+                      } else {
+                          el.insertAdjacentHTML('beforeend', `<div class="tierfy-smart-price">${newHtml}</div>`);
+                      }
+                  }
               });
           })
           .catch(err => console.error("Tierfy Error:", err));
@@ -154,7 +208,6 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
         loadTieredPrices();
     }
 
-    // Monitor for both PDP table injection and AJAX collection pagination/filters
     const observer = new MutationObserver((mutations) => {
         checkAndHidePdpTable();
 
