@@ -20,11 +20,13 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
 5. Paste the following code into the file and click **Save**:
 
 ```liquid
-<!-- Tierfy Collection Pricing & PDP Control -->
+<!-- Tierfy Collection Pricing & PDP Control (Preserving 'From' & Variant Support) -->
 <script>
 (function() {
     const currentCustomerTags = "{% if customer %}{{ customer.tags | join: ',' | downcase | escape }}{% endif %}";
     const currencySymbol = "{{ cart.currency.symbol }}";
+    let cachedRules = null;
+    let cachedProducts = {};
 
     // 1. Product Detail Page (PDP): Hide table if it only has 1 tier for Min Qty = 1
     function checkAndHidePdpTable() {
@@ -47,14 +49,165 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
         }
     }
 
-    // 2. Collection & PDP Discount Display
+    function calculateSavings(price, tier) {
+        const discountVal = parseFloat(tier.discountValue || 0);
+        if (tier.discountType === 'PERCENTAGE') {
+            const priceInCents = Math.round(price * 100);
+            const discountInCents = Math.floor((priceInCents * discountVal) / 100);
+            return discountInCents / 100;
+        }
+        return discountVal;
+    }
+
+    function getMatchingRules(rules, pData) {
+        return rules.filter(rule => {
+            let rVals = [];
+            try {
+                const parsed = JSON.parse(rule.targetValues);
+                rVals = Array.isArray(parsed) ? parsed : [String(parsed)];
+            } catch(e) {
+                rVals = String(rule.targetValues).split(',');
+            }
+            rVals = rVals.map(v => String(v).toLowerCase().trim());
+
+            if (rule.targetType === 'PRODUCT') {
+                return rVals.some(v => {
+                    const shortV = v.split('/').pop();
+                    return v === pData.id || shortV === pData.id || pData.id.includes(shortV);
+                });
+            }
+            if (rule.targetType === 'COLLECTION') {
+                return rVals.some(v => {
+                    const shortV = v.split('/').pop();
+                    return pData.collectionIds.includes(v) || pData.collectionIds.includes(shortV);
+                });
+            }
+            if (rule.targetType === 'TAG') {
+                return rVals.some(v => pData.tags.includes(v));
+            }
+            if (rule.targetType === 'SKU') {
+                return rVals.some(v => pData.skus.includes(v));
+            }
+            return false;
+        });
+    }
+
+    function getBestTiers(matchingRules, basePrice) {
+        const tierMap = new Map();
+        matchingRules.forEach(r => {
+            if (!r.tiers || !Array.isArray(r.tiers)) return;
+            r.tiers.forEach(t => {
+                const minQty = parseInt(t.minQuantity, 10);
+                if (isNaN(minQty)) return;
+
+                const savings = calculateSavings(basePrice, t);
+                const tierObj = { ...t, minQuantity: minQty, _savings: savings };
+                const existing = tierMap.get(minQty);
+                if (!existing || tierObj._savings > existing._savings) {
+                    tierMap.set(minQty, tierObj);
+                }
+            });
+        });
+        return Array.from(tierMap.values()).sort((a, b) => a.minQuantity - b.minQuantity);
+    }
+
+    // 2. Render Single Price Element
+    function renderPriceElement(el, rules) {
+        const pData = {
+            id: String(el.dataset.productId || ''),
+            handle: el.dataset.productHandle || '',
+            price: parseFloat(el.dataset.productPrice || 0),
+            priceMin: parseFloat(el.dataset.priceMin || el.dataset.productPrice || 0),
+            priceMax: parseFloat(el.dataset.priceMax || el.dataset.productPrice || 0),
+            priceVaries: el.dataset.priceVaries === 'true',
+            tags: (el.dataset.tags || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+            collectionIds: (el.dataset.collectionIds || '').split(',').map(s => s.trim()).filter(Boolean),
+            skus: (el.dataset.skus || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        };
+
+        const isPdpElement = Boolean(el.closest('.product, .product__info-wrapper, .product__info-container, .product-single, .product-form, main [class*="product"]'));
+        const matchingRules = getMatchingRules(rules, pData);
+        if (matchingRules.length === 0) return;
+
+        const basePriceToUse = (!isPdpElement && pData.priceVaries) ? pData.priceMin : pData.price;
+        const uniqueTiers = getBestTiers(matchingRules, basePriceToUse);
+        if (uniqueTiers.length === 0) return;
+
+        const tierQty1 = uniqueTiers.find(t => t.minQuantity === 1);
+        const maxSavingsTier = uniqueTiers.reduce((prev, curr) => (prev._savings > curr._savings) ? prev : curr);
+
+        // Detect and preserve theme's "From" element / text if present
+        const ogPriceEl = el.querySelector('.original-theme-price');
+        let fromPrefixHtml = '';
+
+        if (!isPdpElement) {
+            if (ogPriceEl) {
+                const fromEl = ogPriceEl.querySelector('.price__from, [class*="from"], [class*="price-from"]');
+                if (fromEl && fromEl.textContent.trim()) {
+                    fromPrefixHtml = fromEl.outerHTML + ' ';
+                } else if (pData.priceVaries) {
+                    const ogText = ogPriceEl.textContent || '';
+                    const matchFrom = ogText.match(/\b(from|ab|à partir de|desde)\b/i);
+                    if (matchFrom) {
+                        fromPrefixHtml = `<span class="price__from">${matchFrom[0]}</span> `;
+                    } else {
+                        fromPrefixHtml = `<span class="price__from">From</span> `;
+                    }
+                }
+            } else if (pData.priceVaries) {
+                fromPrefixHtml = `<span class="price__from">From</span> `;
+            }
+        }
+
+        let newHtml = '';
+        const originalPriceStr = basePriceToUse.toFixed(2);
+        const originalPriceHtml = `<span style="text-decoration: line-through; opacity: 0.6; margin-right: 6px;">${currencySymbol}${originalPriceStr}</span>`;
+
+        if (isPdpElement) {
+            // PDP: Always show exact active variant price (no "From")
+            if (tierQty1) {
+                const newPrice = (pData.price - tierQty1._savings).toFixed(2);
+                newHtml = `${originalPriceHtml} <span style="color: #e32c2b; font-weight: bold;">${currencySymbol}${newPrice}</span>`;
+            }
+        } else if (uniqueTiers.length === 1 && tierQty1) {
+            // Case 1: Single flat discount (e.g. 50% off) -> Keeps "From" if present
+            const newPrice = (basePriceToUse - tierQty1._savings).toFixed(2);
+            newHtml = `${fromPrefixHtml}${originalPriceHtml}<span style="color: #e32c2b; font-weight: bold;">${currencySymbol}${newPrice}</span>`;
+        } else if (uniqueTiers.length > 1) {
+            // Case 2: Volume tier card
+            const minPrice = (basePriceToUse - maxSavingsTier._savings).toFixed(2);
+            newHtml = `${fromPrefixHtml}<span style="color: #e32c2b; font-weight: bold;">As low as ${currencySymbol}${minPrice}</span>`;
+        } else if (!tierQty1) {
+            // Case 3: Volume tier starting at qty > 1
+            const newPrice = (basePriceToUse - maxSavingsTier._savings).toFixed(2);
+            newHtml = `${fromPrefixHtml}<span style="font-weight: bold; color: #e32c2b;">Buy ${maxSavingsTier.minQuantity}+ for ${currencySymbol}${newPrice}/ea</span>`;
+        }
+
+        if (newHtml) {
+            if (ogPriceEl) ogPriceEl.style.display = 'none';
+
+            let smartPriceEl = el.querySelector('.tierfy-smart-price');
+            if (smartPriceEl) {
+                smartPriceEl.innerHTML = newHtml;
+            } else {
+                el.insertAdjacentHTML('beforeend', `<div class="tierfy-smart-price">${newHtml}</div>`);
+            }
+        }
+    }
+
+    // 3. Collection & PDP Discount Display
     function loadTieredPrices() {
         const priceElements = Array.from(document.querySelectorAll('.tierfy-collection-price:not(.tierfy-processed)'));
         if (priceElements.length === 0) return;
         priceElements.forEach(el => el.classList.add('tierfy-processed'));
 
+        if (cachedRules) {
+            priceElements.forEach(el => renderPriceElement(el, cachedRules));
+            return;
+        }
+
         let allProductIds = [], allTags = [], allCollectionIds = [], allSkus = [];
-        priceElements.forEach(el => {
+        document.querySelectorAll('.tierfy-collection-price').forEach(el => {
             if (el.dataset.productId) allProductIds.push(el.dataset.productId);
             if (el.dataset.tags) allTags = allTags.concat(el.dataset.tags.split(',').map(s => s.trim().toLowerCase()));
             if (el.dataset.collectionIds) allCollectionIds = allCollectionIds.concat(el.dataset.collectionIds.split(',').map(s => s.trim()));
@@ -76,136 +229,90 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
           .then(res => res.json())
           .then(data => {
               if (!data.rules || data.rules.length === 0) return;
-
-              priceElements.forEach(el => {
-                  const pData = {
-                      id: String(el.dataset.productId || ''),
-                      price: parseFloat(el.dataset.productPrice || 0),
-                      tags: (el.dataset.tags || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
-                      collectionIds: (el.dataset.collectionIds || '').split(',').map(s => s.trim()).filter(Boolean),
-                      skus: (el.dataset.skus || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-                  };
-
-                  // Check if this element is inside the main product page (PDP) section
-                  const isPdpElement = Boolean(el.closest('.product, .product__info-wrapper, .product__info-container, .product-single, .product-form, main [class*="product"]'));
-
-                  // Match rules for this specific product
-                  const matchingRules = data.rules.filter(rule => {
-                      let rVals = [];
-                      try {
-                          const parsed = JSON.parse(rule.targetValues);
-                          rVals = Array.isArray(parsed) ? parsed : [String(parsed)];
-                      } catch(e) {
-                          rVals = String(rule.targetValues).split(',');
-                      }
-                      rVals = rVals.map(v => String(v).toLowerCase().trim());
-
-                      if (rule.targetType === 'PRODUCT') {
-                          return rVals.some(v => {
-                              const shortV = v.split('/').pop();
-                              return v === pData.id || shortV === pData.id || pData.id.includes(shortV);
-                          });
-                      }
-                      if (rule.targetType === 'COLLECTION') {
-                          return rVals.some(v => {
-                              const shortV = v.split('/').pop();
-                              return pData.collectionIds.includes(v) || pData.collectionIds.includes(shortV);
-                          });
-                      }
-                      if (rule.targetType === 'TAG') {
-                          return rVals.some(v => pData.tags.includes(v));
-                      }
-                      if (rule.targetType === 'SKU') {
-                          return rVals.some(v => pData.skus.includes(v));
-                      }
-                      return false;
-                  });
-
-                  if (matchingRules.length === 0) return;
-
-                  // Consolidate tiers across matching rules by minQuantity (keeping best discount)
-                  const tierMap = new Map();
-                  matchingRules.forEach(r => {
-                      if (!r.tiers || !Array.isArray(r.tiers)) return;
-                      r.tiers.forEach(t => {
-                          const minQty = parseInt(t.minQuantity, 10);
-                          if (isNaN(minQty)) return;
-
-                          let savings = 0;
-                          const discountVal = parseFloat(t.discountValue || 0);
-                          if (t.discountType === 'PERCENTAGE') {
-                              const priceInCents = Math.round(pData.price * 100);
-                              const discountInCents = Math.floor((priceInCents * discountVal) / 100);
-                              savings = discountInCents / 100;
-                          } else {
-                              savings = discountVal;
-                          }
-
-                          const tierObj = { ...t, minQuantity: minQty, _savings: savings };
-                          const existing = tierMap.get(minQty);
-                          if (!existing || tierObj._savings > existing._savings) {
-                              tierMap.set(minQty, tierObj);
-                          }
-                      });
-                  });
-
-                  const uniqueTiers = Array.from(tierMap.values()).sort((a, b) => a.minQuantity - b.minQuantity);
-                  if (uniqueTiers.length === 0) return;
-
-                  const tierQty1 = uniqueTiers.find(t => t.minQuantity === 1);
-                  const maxSavingsTier = uniqueTiers.reduce((prev, curr) => (prev._savings > curr._savings) ? prev : curr);
-
-                  let newHtml = '';
-                  const originalPriceStr = pData.price.toFixed(2);
-                  const originalPriceHtml = `<span style="text-decoration: line-through; opacity: 0.6; margin-right: 6px;">${currencySymbol}${originalPriceStr}</span>`;
-
-                  if (uniqueTiers.length === 1 && tierQty1) {
-                      // Case 1: Single flat discount (e.g. VIP/Tag 50% off for min qty 1)
-                      const newPrice = (pData.price - tierQty1._savings).toFixed(2);
-                      newHtml = `${originalPriceHtml} <span style="color: #e32c2b; font-weight: bold;">${currencySymbol}${newPrice}</span>`;
-                  } else if (isPdpElement) {
-                      // Case 2: PDP with multiple volume tiers
-                      // PDP main price should show unit price (Qty 1), while the table below displays volume breaks
-                      if (tierQty1) {
-                          const newPrice = (pData.price - tierQty1._savings).toFixed(2);
-                          newHtml = `${originalPriceHtml} <span style="color: #e32c2b; font-weight: bold;">${currencySymbol}${newPrice}</span>`;
-                      } else {
-                          return; // No discount on Qty 1; leave original PDP price intact
-                      }
-                  } else if (uniqueTiers.length > 1) {
-                      // Case 3: Collection page card with multiple volume tiers
-                      const minPrice = (pData.price - maxSavingsTier._savings).toFixed(2);
-                      newHtml = `<span style="color: #e32c2b; font-weight: bold;">As low as ${currencySymbol}${minPrice}</span>`;
-                  } else if (!tierQty1) {
-                      // Case 4: Single volume tier starting at qty > 1 (e.g. Buy 5+ get 20% off)
-                      const newPrice = (pData.price - maxSavingsTier._savings).toFixed(2);
-                      newHtml = `<span style="font-weight: bold; color: #e32c2b;">Buy ${maxSavingsTier.minQuantity}+ for ${currencySymbol}${newPrice}/ea</span>`;
-                  }
-
-                  if (newHtml) {
-                      const ogPriceEl = el.querySelector('.original-theme-price');
-                      if (ogPriceEl) ogPriceEl.style.display = 'none';
-
-                      const existingSmartPrice = el.querySelector('.tierfy-smart-price');
-                      if (existingSmartPrice) {
-                          existingSmartPrice.innerHTML = newHtml;
-                      } else {
-                          el.insertAdjacentHTML('beforeend', `<div class="tierfy-smart-price">${newHtml}</div>`);
-                      }
-                  }
+              cachedRules = data.rules;
+              document.querySelectorAll('.tierfy-collection-price').forEach(el => {
+                  renderPriceElement(el, cachedRules);
               });
           })
           .catch(err => console.error("Tierfy Error:", err));
+    }
+
+    // 4. Dynamic Variant Change Handler on PDP
+    function handleVariantChange() {
+        const pdpPriceElements = document.querySelectorAll('.product .tierfy-collection-price, .product__info-wrapper .tierfy-collection-price, .product-form .tierfy-collection-price, main [class*="product"] .tierfy-collection-price');
+        if (pdpPriceElements.length === 0) return;
+
+        const urlParams = new URLSearchParams(window.location.search);
+        let variantId = urlParams.get('variant');
+
+        if (!variantId) {
+            const variantInput = document.querySelector('input[name="id"], select[name="id"]');
+            if (variantInput) variantId = variantInput.value;
+        }
+        if (!variantId) return;
+
+        pdpPriceElements.forEach(el => {
+            const handle = el.dataset.productHandle;
+            if (!handle) return;
+
+            function applyVariantPrice(productData) {
+                const variant = (productData.variants || []).find(v => String(v.id) === String(variantId));
+                if (variant) {
+                    el.dataset.productPrice = (variant.price / 100.0).toString();
+                    if (variant.sku) el.dataset.skus = variant.sku.toLowerCase();
+                    if (cachedRules) {
+                        renderPriceElement(el, cachedRules);
+                    }
+                }
+            }
+
+            if (cachedProducts[handle]) {
+                applyVariantPrice(cachedProducts[handle]);
+            } else {
+                const root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || '/';
+                fetch(`${root}products/${handle}.js`)
+                    .then(r => r.json())
+                    .then(data => {
+                        cachedProducts[handle] = data;
+                        applyVariantPrice(data);
+                    })
+                    .catch(() => {});
+            }
+        });
+    }
+
+    // Setup Variant Listeners (URL History, Radio/Select Changes, Custom Events)
+    function setupVariantListeners() {
+        const origPushState = history.pushState;
+        const origReplaceState = history.replaceState;
+        history.pushState = function() {
+            origPushState.apply(this, arguments);
+            setTimeout(handleVariantChange, 20);
+        };
+        history.replaceState = function() {
+            origReplaceState.apply(this, arguments);
+            setTimeout(handleVariantChange, 20);
+        };
+        window.addEventListener('popstate', handleVariantChange);
+        document.addEventListener('change', function(e) {
+            if (e.target.matches('input[name="id"], select[name="id"], [name*="options["], variant-radios input, variant-selects select')) {
+                setTimeout(handleVariantChange, 50);
+            }
+        });
+        document.addEventListener('variant:change', handleVariantChange);
+        document.addEventListener('theme:variant:change', handleVariantChange);
     }
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', function() {
             checkAndHidePdpTable();
             loadTieredPrices();
+            setupVariantListeners();
         });
     } else {
         checkAndHidePdpTable();
         loadTieredPrices();
+        setupVariantListeners();
     }
 
     const observer = new MutationObserver((mutations) => {
@@ -216,9 +323,9 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
             if (mutation.addedNodes.length) {
                 mutation.addedNodes.forEach(node => {
                     if (node.nodeType === 1) {
-                        if (node.classList && node.classList.contains('tierfy-collection-price') && !node.classList.contains('tierfy-processed')) {
+                        if (node.classList && node.classList.contains('tierfy-collection-price')) {
                             shouldLoad = true;
-                        } else if (node.querySelector && node.querySelector('.tierfy-collection-price:not(.tierfy-processed)')) {
+                        } else if (node.querySelector && node.querySelector('.tierfy-collection-price')) {
                             shouldLoad = true;
                         }
                     }
@@ -256,18 +363,25 @@ Display discounted wholesale/VIP prices directly on collection pages and automat
 2. Find the main price container and **wrap it** with `<div class="tierfy-collection-price">`:
 
 ```liquid
-{%- assign tierfy_product = product_resource | default: product | default: card_product -%}
+{%- liquid
+  assign tierfy_product = product_resource | default: product | default: card_product
+  assign tierfy_target = target | default: tierfy_product.selected_or_first_available_variant | default: tierfy_product
+-%}
 <div class="tierfy-collection-price"
-     data-product-id="{{ tierfy_product.id | default: product.id | default: card_product.id }}"
-     data-product-price="{{ tierfy_product.price | default: product.price | default: card_product.price | divided_by: 100.0 }}"
-     data-tags="{{ tierfy_product.tags | default: product.tags | default: card_product.tags | join: ',' | downcase | escape }}"
-     data-collection-ids="{{ tierfy_product.collections | default: product.collections | default: card_product.collections | map: 'id' | join: ',' }}"
-     data-skus="{{ tierfy_product.variants | default: product.variants | default: card_product.variants | map: 'sku' | join: ',' | downcase | escape }}">
+     data-product-id="{{ tierfy_product.id }}"
+     data-product-handle="{{ tierfy_product.handle }}"
+     data-product-price="{{ tierfy_target.price | default: tierfy_product.price | divided_by: 100.0 }}"
+     data-price-min="{{ tierfy_product.price_min | divided_by: 100.0 }}"
+     data-price-max="{{ tierfy_product.price_max | divided_by: 100.0 }}"
+     data-price-varies="{{ tierfy_product.price_varies }}"
+     data-selected-variant-id="{{ tierfy_target.id }}"
+     data-tags="{{ tierfy_product.tags | join: ',' | downcase | escape }}"
+     data-collection-ids="{{ tierfy_product.collections | map: 'id' | join: ',' }}"
+     data-skus="{{ tierfy_product.variants | map: 'sku' | join: ',' | downcase | escape }}">
   
   <div class="original-theme-price">
-    <!-- YOUR EXISTING PRICE CONTAINER / LIQUID CODE HERE -->
+    <!-- YOUR EXISTING THEME PRICE LIQUID CODE HERE -->
   </div>
-
 </div>
 ```
 3. Click **Save**.
